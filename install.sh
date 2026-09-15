@@ -42,10 +42,13 @@ install -d -m 700 /etc/brutal-ip-link
 old_token=$(sed -n 's/^BRUTAL_LINK_TOKEN=//p' /etc/brutal-ip-link/env 2>/dev/null | head -1 || true)
 old_rate=$(sed -n 's/^BRUTAL_LINK_RATE=//p' /etc/brutal-ip-link/env 2>/dev/null | head -1 || true)
 old_table=$(sed -n 's/^BRUTAL_LINK_TABLE=//p' /etc/brutal-ip-link/env 2>/dev/null | head -1 || true)
+old_xray=$(sed -n 's/^BRUTAL_LINK_XRAY_UNIT=//p' /etc/brutal-ip-link/env 2>/dev/null | head -1 || true)
 detected_table=$(ip -4 route get 1.1.1.1 from "$server_ip" 2>/dev/null | sed -n 's/.* table \([^ ]*\).*/\1/p' | head -1 || true)
+detected_xray=$(systemctl cat xray.service >/dev/null 2>&1 && printf xray.service || true)
 token=${BRUTAL_LINK_TOKEN:-${old_token:-$(openssl rand -hex 24)}}
 rate=${BRUTAL_LINK_RATE:-${old_rate:-100}}
 table=${BRUTAL_LINK_TABLE-${old_table:-$detected_table}}
+xray=${BRUTAL_LINK_XRAY_UNIT-${old_xray:-$detected_xray}}
 
 [[ ${#token} -ge 32 && "$token" != *[!A-Za-z0-9_-]* ]] || {
   echo "BRUTAL_LINK_TOKEN must be at least 32 URL-safe characters." >&2
@@ -59,10 +62,15 @@ table=${BRUTAL_LINK_TABLE-${old_table:-$detected_table}}
   echo "BRUTAL_LINK_TABLE must be a numeric policy routing table." >&2
   exit 1
 }
+[[ -z "$xray" || "$xray" =~ ^[A-Za-z0-9_.@-]+$ ]] || {
+  echo "BRUTAL_LINK_XRAY_UNIT is invalid." >&2
+  exit 1
+}
 
 install -m 755 "$app" /usr/local/sbin/brutal-ip-link
 install -m 644 "$unit" /etc/systemd/system/brutal-ip-link.service
-printf 'BRUTAL_LINK_TOKEN=%s\nBRUTAL_LINK_RATE=%s\nBRUTAL_LINK_TABLE=%s\n' "$token" "$rate" "$table" \
+printf 'BRUTAL_LINK_TOKEN=%s\nBRUTAL_LINK_RATE=%s\nBRUTAL_LINK_TABLE=%s\nBRUTAL_LINK_XRAY_UNIT=%s\n' \
+  "$token" "$rate" "$table" "$xray" \
   > /etc/brutal-ip-link/env
 chmod 600 /etc/brutal-ip-link/env
 
@@ -86,4 +94,5 @@ systemctl is-active --quiet brutal-ip-link.service
 echo
 echo "Installed: https://$server_ip:8443/$token"
 [[ -z "$table" ]] || echo "Policy routing table: $table"
+[[ -z "$xray" ]] || echo "Automatic Xray detection: $xray"
 echo "The certificate is self-signed; confirm the warning on first visit."

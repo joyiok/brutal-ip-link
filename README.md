@@ -1,18 +1,19 @@
 # brutal-ip-link
 
-通过访问一个秘密 HTTPS 链接，把访问者当前的公网 IP 自动加入
-[TCP Brutal v2](https://github.com/HyNetworks/tcp-brutal) 规则。适合客户端公网 IP
-经常变化、但只需要维护一个使用者的服务器。
+从 Xray 认证日志识别客户端公网 IP，自动加入
+[TCP Brutal v2](https://github.com/HyNetworks/tcp-brutal) 规则。秘密 HTTPS 链接作为
+手动兜底。适合客户端公网 IP 经常变化、但只需要维护一个使用者的服务器。
 
-访问成功时，程序会：
+识别到新 IP 时，程序会：
 
 1. 执行 `brutalctl add <当前IP>/32 <速率>`；
 2. 如果服务器使用策略路由，同时把 Brutal 路由写入对应路由表；
 3. 删除上一次记录的 IP 规则；
 4. 将当前 IP 保存到 `/var/lib/brutal-ip-link/current-prefix`。
 
-只使用 Python 标准库，不信任可伪造的 `X-Forwarded-For`，也不会把秘密 URL
-写入日志。
+程序只在公网接入日志后 5 秒内出现带 `email:` 的 Xray 认证成功日志时更新，
+普通端口扫描不会直接触发。只使用 Python 标准库，不信任可伪造的
+`X-Forwarded-For`，也不会把秘密 URL 写入日志。
 
 ## 要求
 
@@ -27,8 +28,9 @@
 curl -fsSL https://raw.githubusercontent.com/joyiok/brutal-ip-link/main/install.sh | sudo bash
 ```
 
-脚本会自动生成 token、自签名 HTTPS 证书和 systemd 服务，并检测源地址策略路由表，
-最后输出专属链接。重复执行不会更换已有 token。
+脚本会自动生成 token、自签名 HTTPS 证书和 systemd 服务，检测源地址策略路由表；
+存在 `xray.service` 时自动启用日志监听，最后输出备用专属链接。重复执行不会更换
+已有 token。
 
 指定发送速率或服务器公网 IPv4：
 
@@ -56,7 +58,10 @@ sudo bash install.sh
 
 ## 使用
 
-首次打开时，浏览器会提示自签名证书不受信任，确认服务器地址后继续：
+正常使用无需访问链接：Xray 用户认证后，后续新连接会自动使用 Brutal。首次识别
+新 IP 的那条连接已经建立，不受新规则影响。
+
+自动识别失败时可打开备用链接；首次打开时浏览器会提示自签名证书不受信任：
 
 ```text
 https://SERVER_IP:8443/YOUR_RANDOM_TOKEN
@@ -77,6 +82,12 @@ sudo systemctl status brutal-ip-link
 sudo journalctl -u brutal-ip-link -n 50
 sudo brutalctl list
 ip route show table 10001 proto 233
+```
+
+自动更新成功时，服务日志包含：
+
+```text
+Xray authenticated; updated 198.51.100.20/32
 ```
 
 使用策略路由时，`brutalctl list` 的 `MEMBERS` 应大于 `0`，`SENT(MB)` 应随新连接
