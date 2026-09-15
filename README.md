@@ -20,40 +20,28 @@
 - `/usr/local/bin/brutalctl` 可用；
 - Python 3、systemd 和 OpenSSL。
 
-## 安装
+## 一键安装
 
 ```bash
-sudo install -m 755 brutal-ip-link.py /usr/local/sbin/brutal-ip-link
-sudo install -m 644 brutal-ip-link.service /etc/systemd/system/
-sudo install -d -m 700 /etc/brutal-ip-link
-
-# 生成至少 32 字符的秘密 token，保存输出
-openssl rand -hex 24
-
-sudo editor /etc/brutal-ip-link/env
+curl -fsSL https://raw.githubusercontent.com/joyiok/brutal-ip-link/main/install.sh | sudo bash
 ```
 
-写入以下配置，把占位符替换为刚生成的 token：
+脚本会自动生成 token、自签名 HTTPS 证书和 systemd 服务，最后输出专属链接。
+重复执行不会更换已有 token。
 
-```ini
-BRUTAL_LINK_TOKEN=YOUR_RANDOM_TOKEN
-BRUTAL_LINK_RATE=100
-```
-
-保护配置并生成自签名证书；将 `SERVER_IP` 换成服务器公网 IPv4：
+指定发送速率或服务器公网 IPv4：
 
 ```bash
-sudo chmod 600 /etc/brutal-ip-link/env
-SERVER_IP=203.0.113.10
-sudo openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
-  -keyout /etc/brutal-ip-link/key.pem \
-  -out /etc/brutal-ip-link/cert.pem \
-  -subj "/CN=$SERVER_IP" \
-  -addext "subjectAltName=IP:$SERVER_IP"
-sudo chmod 600 /etc/brutal-ip-link/key.pem
+curl -fsSL https://raw.githubusercontent.com/joyiok/brutal-ip-link/main/install.sh | \
+  sudo env BRUTAL_LINK_RATE=200 SERVER_IP=203.0.113.10 bash
+```
 
-sudo systemctl daemon-reload
-sudo systemctl enable --now brutal-ip-link
+也可以克隆后运行：
+
+```bash
+git clone https://github.com/joyiok/brutal-ip-link.git
+cd brutal-ip-link
+sudo bash install.sh
 ```
 
 如果服务器启用了防火墙，还需允许 TCP `8443` 端口。
