@@ -1,0 +1,18 @@
+[Unit]
+Description=TCP Brutal IP link
+After=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/brutal-ip-link/env
+ExecStart=/usr/local/sbin/brutal-ip-link
+Restart=on-failure
+StateDirectory=brutal-ip-link
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+
+[Install]
+WantedBy=multi-user.target
