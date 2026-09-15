@@ -14,11 +14,14 @@ done
   exit 1
 }
 
-script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+script_dir=""
+if [[ -n ${BASH_SOURCE[0]:-} ]]; then
+  script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+fi
 tmp_dir=$(mktemp -d)
 trap 'rm -rf "$tmp_dir"' EXIT
 
-if [[ -f "$script_dir/brutal-ip-link.py" && -f "$script_dir/brutal-ip-link.service" ]]; then
+if [[ -n "$script_dir" && -f "$script_dir/brutal-ip-link.py" && -f "$script_dir/brutal-ip-link.service" ]]; then
   app="$script_dir/brutal-ip-link.py"
   unit="$script_dir/brutal-ip-link.service"
 else
@@ -41,20 +44,31 @@ python3 -c 'import ipaddress, sys; a = ipaddress.ip_address(sys.argv[1]); assert
 install -d -m 700 /etc/brutal-ip-link
 old_token=$(sed -n 's/^BRUTAL_LINK_TOKEN=//p' /etc/brutal-ip-link/env 2>/dev/null | head -1 || true)
 old_rate=$(sed -n 's/^BRUTAL_LINK_RATE=//p' /etc/brutal-ip-link/env 2>/dev/null | head -1 || true)
-old_table=$(sed -n 's/^BRUTAL_LINK_TABLE=//p' /etc/brutal-ip-link/env 2>/dev/null | head -1 || true)
-old_xray=$(sed -n 's/^BRUTAL_LINK_XRAY_UNIT=//p' /etc/brutal-ip-link/env 2>/dev/null | head -1 || true)
 detected_table=$(ip -4 route get 1.1.1.1 from "$server_ip" 2>/dev/null | sed -n 's/.* table \([^ ]*\).*/\1/p' | head -1 || true)
 detected_xray=$(systemctl cat xray.service >/dev/null 2>&1 && printf xray.service || true)
+old_table=$detected_table
+old_xray=$detected_xray
+old_email=""
+if [[ -f /etc/brutal-ip-link/env ]]; then
+  while IFS='=' read -r key value; do
+    case "$key" in
+      BRUTAL_LINK_TABLE) old_table=$value ;;
+      BRUTAL_LINK_XRAY_UNIT) old_xray=$value ;;
+      BRUTAL_LINK_XRAY_EMAIL) old_email=$value ;;
+    esac
+  done < /etc/brutal-ip-link/env
+fi
 token=${BRUTAL_LINK_TOKEN:-${old_token:-$(openssl rand -hex 24)}}
 rate=${BRUTAL_LINK_RATE:-${old_rate:-100}}
-table=${BRUTAL_LINK_TABLE-${old_table:-$detected_table}}
-xray=${BRUTAL_LINK_XRAY_UNIT-${old_xray:-$detected_xray}}
+table=${BRUTAL_LINK_TABLE-$old_table}
+xray=${BRUTAL_LINK_XRAY_UNIT-$old_xray}
+email=${BRUTAL_LINK_XRAY_EMAIL-$old_email}
 
 [[ ${#token} -ge 32 && "$token" != *[!A-Za-z0-9_-]* ]] || {
   echo "BRUTAL_LINK_TOKEN must be at least 32 URL-safe characters." >&2
   exit 1
 }
-[[ "$rate" =~ ^[0-9]+$ ]] && (( rate >= 1 && rate <= 1000000 )) || {
+[[ "$rate" =~ ^[0-9]{1,7}$ ]] && (( 10#$rate >= 1 && 10#$rate <= 1000000 )) || {
   echo "BRUTAL_LINK_RATE must be an integer from 1 to 1000000." >&2
   exit 1
 }
@@ -66,13 +80,21 @@ xray=${BRUTAL_LINK_XRAY_UNIT-${old_xray:-$detected_xray}}
   echo "BRUTAL_LINK_XRAY_UNIT is invalid." >&2
   exit 1
 }
+[[ -z "$email" || "$email" =~ ^[A-Za-z0-9_.@+-]+$ ]] || {
+  echo "BRUTAL_LINK_XRAY_EMAIL contains unsupported characters." >&2
+  exit 1
+}
+if [[ -n "$xray" ]]; then
+  command -v journalctl >/dev/null || { echo "Missing command: journalctl" >&2; exit 1; }
+fi
 
 install -m 755 "$app" /usr/local/sbin/brutal-ip-link
 install -m 644 "$unit" /etc/systemd/system/brutal-ip-link.service
-printf 'BRUTAL_LINK_TOKEN=%s\nBRUTAL_LINK_RATE=%s\nBRUTAL_LINK_TABLE=%s\nBRUTAL_LINK_XRAY_UNIT=%s\n' \
-  "$token" "$rate" "$table" "$xray" \
-  > /etc/brutal-ip-link/env
-chmod 600 /etc/brutal-ip-link/env
+umask 077
+printf 'BRUTAL_LINK_TOKEN=%s\nBRUTAL_LINK_RATE=%s\nBRUTAL_LINK_TABLE=%s\nBRUTAL_LINK_XRAY_UNIT=%s\nBRUTAL_LINK_XRAY_EMAIL=%s\n' \
+  "$token" "$rate" "$table" "$xray" "$email" \
+  > /etc/brutal-ip-link/env.new
+mv /etc/brutal-ip-link/env.new /etc/brutal-ip-link/env
 
 cert_ip=$(cat /etc/brutal-ip-link/cert-ip 2>/dev/null || true)
 if [[ ! -f /etc/brutal-ip-link/key.pem || ! -f /etc/brutal-ip-link/cert.pem || "$cert_ip" != "$server_ip" ]]; then
@@ -95,4 +117,5 @@ echo
 echo "Installed: https://$server_ip:8443/$token"
 [[ -z "$table" ]] || echo "Policy routing table: $table"
 [[ -z "$xray" ]] || echo "Automatic Xray detection: $xray"
+[[ -z "$xray" ]] || echo "Requires an authenticated access log with the real public source IP and email."
 echo "The certificate is self-signed; confirm the warning on first visit."

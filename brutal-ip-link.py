@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import hmac
 import ipaddress
+import json
 import os
 import re
 import ssl
@@ -8,24 +9,31 @@ import subprocess
 import sys
 import threading
 import time
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 TOKEN = os.environ.get("BRUTAL_LINK_TOKEN", "")
 RATE = int(os.environ.get("BRUTAL_LINK_RATE", "100"))
 TABLE = os.environ.get("BRUTAL_LINK_TABLE", "")
 XRAY_UNIT = os.environ.get("BRUTAL_LINK_XRAY_UNIT", "")
+XRAY_EMAIL = os.environ.get("BRUTAL_LINK_XRAY_EMAIL", "")
 STATE = Path("/var/lib/brutal-ip-link/current-prefix")
+PENDING = STATE.with_name("pending-prefix")
+RULES = Path("/proc/net/tcp_brutal/rules")
 CTL = "/usr/local/bin/brutalctl"
 UPDATE_LOCK = threading.Lock()
 XRAY_SOURCE = re.compile(
-    r"\bfrom (\[[0-9a-fA-F:]+\]|[0-9.]+):\d+ accepted .*\[dokodemo-in-"
+    r"^(?:\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2}(?:\.\d+)? )?"
+    r"from (?:tcp:|udp:)?(\[[0-9a-fA-F:.]+\]|[0-9.]+):\d+ accepted "
+    r"(?:tcp|udp):\S+(?: \[[^\]\r\n]+\])? email: (\S+)$"
 )
 
 
 def prefix_for(value):
     address = ipaddress.ip_address(value)
-    if not address.is_global:
+    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped:
+        address = address.ipv4_mapped
+    if not address.is_global or address.is_multicast:
         raise ValueError("request did not come from a public IP")
     return f"{address}/{32 if address.version == 4 else 128}"
 
@@ -33,24 +41,33 @@ def prefix_for(value):
 def policy_route_args(prefix, default):
     words = default.split()
     args = ["ip", "-6" if ":" in prefix else "-4", "route", "replace", prefix]
-    for field in ("via", "dev"):
+    if "nexthop" in words:
+        raise ValueError("multipath policy routes are not supported")
+    for field in ("via", "dev", "src"):
         if field in words:
             args += [field, words[words.index(field) + 1]]
     if "dev" not in words:
         raise ValueError(f"no device in table {TABLE} default route")
+    if "onlink" in words:
+        args.append("onlink")
     return args + ["table", TABLE, "congctl", "lock", "brutal", "proto", "233"]
 
 
-def policy_route(prefix, delete=False):
+def routes_for(prefix, table, owned=False):
+    return subprocess.run(
+        ["ip", "-6" if ":" in prefix else "-4", "route", "show", "table", table,
+         "exact", prefix] + (["proto", "233"] if owned else []),
+        check=True, capture_output=True, text=True, timeout=10,
+    ).stdout.strip()
+
+
+def policy_route(prefix):
     if not TABLE:
         return
     family = "-6" if ":" in prefix else "-4"
-    if delete:
-        subprocess.run(
-            ["ip", family, "route", "del", prefix, "table", TABLE, "proto", "233"],
-            timeout=10,
-        )
-        return
+    # ip omits the protocol field when filtering by it; compare matching route counts.
+    if len(routes_for(prefix, TABLE).splitlines()) != len(routes_for(prefix, TABLE, owned=True).splitlines()):
+        raise ValueError(f"refusing to replace an unmanaged route in table {TABLE}")
     default = subprocess.run(
         ["ip", family, "route", "show", "table", TABLE, "default"],
         check=True,
@@ -63,23 +80,94 @@ def policy_route(prefix, delete=False):
     subprocess.run(policy_route_args(prefix, default[0]), check=True, timeout=10)
 
 
-def update_prefix(prefix, force=True):
+def read_prefix(path):
+    if not path.exists():
+        return ""
+    prefix = path.read_text().strip()
+    network = ipaddress.ip_network(prefix, strict=True)
+    if network.prefixlen != network.max_prefixlen:
+        raise ValueError(f"invalid host prefix in {path}")
+    return prefix_for(str(network.network_address))
+
+
+def write_prefix(path, prefix):
+    temporary = path.with_suffix(".tmp")
+    with temporary.open("w") as output:
+        output.write(prefix + "\n")
+        output.flush()
+        os.fsync(output.fileno())
+    temporary.replace(path)
+    directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+
+
+def rule_for(prefix):
+    try:
+        for line in RULES.read_text().splitlines():
+            fields = dict(word.split("=", 1) for word in line.split() if "=" in word)
+            if fields.get("dst") == prefix:
+                return fields
+    except FileNotFoundError:
+        pass
+    return {}
+
+
+def remove_prefix(prefix):
+    if rule_for(prefix):
+        subprocess.run([CTL, "del", prefix], check=True, timeout=10)
+    # brutalctl may silently fail to remove its main-table route.
+    for table in dict.fromkeys(["main"] + ([TABLE] if TABLE else [])):
+        if routes_for(prefix, table, owned=True):
+            subprocess.run(
+                ["ip", "-6" if ":" in prefix else "-4", "route", "del", prefix,
+                 "table", table, "proto", "233"], check=True, timeout=10,
+            )
+
+
+def update_prefix(prefix=None, force=True):
     with UPDATE_LOCK:
-        old = STATE.read_text().strip() if STATE.exists() else ""
-        if not force and old == prefix:
+        old, pending = read_prefix(STATE), read_prefix(PENDING)
+        prefix = prefix or pending or old
+        if not prefix:
             return False
-        subprocess.run([CTL, "add", prefix, str(RATE)], check=True, timeout=10)
-        policy_route(prefix)
+        network = ipaddress.ip_network(prefix, strict=True)
+        if prefix_for(str(network.network_address)) != prefix:
+            raise ValueError("only canonical public host prefixes are allowed")
+        if pending and pending not in (old, prefix):
+            remove_prefix(pending)
+            PENDING.unlink()
+        if not force and old == prefix and not pending:
+            rule = rule_for(prefix)
+            if (rule.get("rate") == str(RATE * 125_000) and rule.get("lock") == "1"
+                    and "congctl lock brutal" in routes_for(prefix, TABLE or "main", owned=True)):
+                return False
+        # Record ownership before any side effect so an interrupted update is recoverable.
+        write_prefix(PENDING, prefix)
+        try:
+            subprocess.run([CTL, "add", prefix, str(RATE)] + (["noroute"] if TABLE else []),
+                           check=True, timeout=10)
+            policy_route(prefix)
+        except Exception:
+            if prefix != old:
+                try:
+                    remove_prefix(prefix)
+                    PENDING.unlink()
+                except Exception as error:
+                    print(f"rollback pending: {error}", file=sys.stderr, flush=True)
+            raise
         if old and old != prefix:
-            subprocess.run([CTL, "del", old], timeout=10)
-            policy_route(old, delete=True)
-        STATE.write_text(prefix + "\n")
+            remove_prefix(old)
+        write_prefix(STATE, prefix)
+        PENDING.unlink()
         return True
 
 
 def xray_source(line):
-    match = XRAY_SOURCE.search(line)
-    if not match:
+    match = XRAY_SOURCE.fullmatch(line.rstrip("\n"))
+    if not match or (XRAY_EMAIL and match.group(2) != XRAY_EMAIL):
         return ""
     try:
         return prefix_for(match.group(1).strip("[]"))
@@ -88,32 +176,78 @@ def xray_source(line):
 
 
 def watch_xray():
+    cursor = ""
     while True:
-        candidate = (0.0, "")
-        process = subprocess.Popen(
-            ["journalctl", "-fu", XRAY_UNIT, "-n", "0", "-o", "cat"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True,
-        )
-        for line in process.stdout:
-            prefix = xray_source(line)
-            if prefix:
-                candidate = (time.monotonic(), prefix)
-            elif " email: " in line and candidate[1] and time.monotonic() - candidate[0] <= 5:
-                try:
-                    if update_prefix(candidate[1], force=False):
-                        print(f"Xray authenticated; updated {candidate[1]}", flush=True)
-                except Exception as error:
-                    print(f"Xray update failed: {error}", file=sys.stderr, flush=True)
-                candidate = (0.0, "")
-        process.wait()
+        try:
+            with subprocess.Popen(
+                ["journalctl", "-fu", XRAY_UNIT, "-o", "json"]
+                + (["--after-cursor", cursor] if cursor else ["-n", "0"]),
+                stdout=subprocess.PIPE, text=True, errors="replace",
+            ) as process:
+                for line in process.stdout:
+                    try:
+                        event = json.loads(line)
+                        cursor = event.get("__CURSOR", cursor)
+                        prefix = xray_source(event.get("MESSAGE", ""))
+                        if prefix and update_prefix(prefix, force=False):
+                            print(f"Xray authenticated; updated {prefix}", flush=True)
+                    except Exception as error:
+                        print(f"Xray update failed: {error}", file=sys.stderr, flush=True)
+            print(f"journalctl exited: {process.returncode}; retrying", file=sys.stderr, flush=True)
+            if process.returncode:
+                cursor = ""
+        except OSError as error:
+            print(f"Xray watcher failed: {error}", file=sys.stderr, flush=True)
         time.sleep(5)
+
+
+def maintain_rules():
+    while True:
+        try:
+            if update_prefix(force=False):
+                print("Saved TCP Brutal rule restored", flush=True)
+        except Exception as error:
+            print(f"restore failed; will retry: {error}", file=sys.stderr, flush=True)
+        time.sleep(30)
+
+
+class TLSServer(ThreadingHTTPServer):
+    request_timeout = 5
+
+    def __init__(self, address, handler, tls):
+        self.tls = tls
+        self.slots = threading.BoundedSemaphore(32)
+        super().__init__(address, handler)
+
+    def process_request(self, request, address):
+        if not self.slots.acquire(blocking=False):
+            request.close()
+            return
+        try:
+            super().process_request(request, address)
+        except Exception:
+            self.slots.release()
+            raise
+
+    def process_request_thread(self, request, address):
+        try:
+            request.settimeout(self.request_timeout)
+            request = self.tls.wrap_socket(request, server_side=True)
+            self.finish_request(request, address)
+        except (OSError, ssl.SSLError):
+            pass  # Timeouts and peers closing a connection are normal on a public listener.
+        except Exception:
+            self.handle_error(request, address)
+        finally:
+            try:
+                self.shutdown_request(request)
+            finally:
+                self.slots.release()
 
 
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
-        if not TOKEN or not hmac.compare_digest(self.path, "/" + TOKEN):
+        if not TOKEN or not hmac.compare_digest(self.path.encode(), ("/" + TOKEN).encode()):
             self.send_error(404)
             return
 
@@ -145,8 +279,9 @@ def main():
             "dev", "eth0", "table", TABLE, "congctl", "lock", "brutal", "proto", "233",
         ]
         assert xray_source(
-            "from 8.8.8.8:12345 accepted tcp:127.0.0.1:45987 [dokodemo-in-test]"
+            "from 8.8.8.8:12345 accepted tcp:example.com:443 [direct] email: " + (XRAY_EMAIL or "owner")
         ) == "8.8.8.8/32"
+        assert not xray_source("from 8.8.8.8:12345 accepted tcp:127.0.0.1:45987 [dokodemo-in-test]")
         assert not xray_source("from 127.0.0.1:12345 accepted tcp:example.com:443 [direct]")
         try:
             prefix_for("127.0.0.1")
@@ -155,21 +290,17 @@ def main():
         raise AssertionError("private address accepted")
 
     if (
-        len(TOKEN) < 32
+        not re.fullmatch(r"[A-Za-z0-9_-]{32,}", TOKEN)
         or not 1 <= RATE <= 1_000_000
         or (TABLE and not TABLE.isdigit())
         or (XRAY_UNIT and not re.fullmatch(r"[A-Za-z0-9_.@-]+", XRAY_UNIT))
+        or (XRAY_EMAIL and not re.fullmatch(r"\S+", XRAY_EMAIL))
     ):
         raise SystemExit("invalid configuration")
-    server = HTTPServer(("0.0.0.0", 8443), Handler)
     tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     tls.load_cert_chain("/etc/brutal-ip-link/cert.pem", "/etc/brutal-ip-link/key.pem")
-    server.socket = tls.wrap_socket(server.socket, server_side=True)
-    if STATE.exists():
-        try:
-            update_prefix(STATE.read_text().strip())
-        except Exception as error:
-            print(f"restore failed: {error}", file=sys.stderr, flush=True)
+    server = TLSServer(("0.0.0.0", 8443), Handler, tls)
+    threading.Thread(target=maintain_rules, daemon=True).start()
     if XRAY_UNIT:
         threading.Thread(target=watch_xray, daemon=True).start()
     server.serve_forever()
