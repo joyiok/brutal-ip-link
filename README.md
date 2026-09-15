@@ -7,8 +7,9 @@
 访问成功时，程序会：
 
 1. 执行 `brutalctl add <当前IP>/32 <速率>`；
-2. 删除上一次记录的 IP 规则；
-3. 将当前 IP 保存到 `/var/lib/brutal-ip-link/current-prefix`。
+2. 如果服务器使用策略路由，同时把 Brutal 路由写入对应路由表；
+3. 删除上一次记录的 IP 规则；
+4. 将当前 IP 保存到 `/var/lib/brutal-ip-link/current-prefix`。
 
 只使用 Python 标准库，不信任可伪造的 `X-Forwarded-For`，也不会把秘密 URL
 写入日志。
@@ -26,14 +27,21 @@
 curl -fsSL https://raw.githubusercontent.com/joyiok/brutal-ip-link/main/install.sh | sudo bash
 ```
 
-脚本会自动生成 token、自签名 HTTPS 证书和 systemd 服务，最后输出专属链接。
-重复执行不会更换已有 token。
+脚本会自动生成 token、自签名 HTTPS 证书和 systemd 服务，并检测源地址策略路由表，
+最后输出专属链接。重复执行不会更换已有 token。
 
 指定发送速率或服务器公网 IPv4：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/joyiok/brutal-ip-link/main/install.sh | \
   sudo env BRUTAL_LINK_RATE=200 SERVER_IP=203.0.113.10 bash
+```
+
+如自动检测不正确，可显式指定策略路由表：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/joyiok/brutal-ip-link/main/install.sh | \
+  sudo env BRUTAL_LINK_TABLE=10001 bash
 ```
 
 也可以克隆后运行：
@@ -68,7 +76,11 @@ TCP Brutal enabled for 198.51.100.20/32 at 100 Mbps
 sudo systemctl status brutal-ip-link
 sudo journalctl -u brutal-ip-link -n 50
 sudo brutalctl list
+ip route show table 10001 proto 233
 ```
+
+使用策略路由时，`brutalctl list` 的 `MEMBERS` 应大于 `0`，`SENT(MB)` 应随新连接
+流量增长。规则只影响添加后建立的新连接。
 
 修改 `/etc/brutal-ip-link/env` 后重启服务：
 
