@@ -102,7 +102,10 @@ class Kernel:
 
 
 def check_updates():
-    a, b, c = "8.8.8.8/32", "1.1.1.1/32", "9.9.9.9/32"
+    a, b, c, d, e, f, g, h = (
+        "8.8.8.8/32", "1.1.1.1/32", "9.9.9.9/32", "208.67.222.222/32",
+        "8.8.4.4/32", "1.0.0.1/32", "208.67.220.220/32", "4.2.2.1/32",
+    )
     with tempfile.TemporaryDirectory() as directory, ExitStack() as stack:
         for name, filename in (("STATE", "current-prefix"), ("PENDING", "pending-prefix"), ("RULES", "rules")):
             stack.enter_context(patch.object(app, name, Path(directory) / filename))
@@ -113,7 +116,7 @@ def check_updates():
         stack.enter_context(redirect_stderr(io.StringIO()))
 
         assert app.update_prefix(a)
-        assert app.read_prefix(app.STATE) == a and not app.PENDING.exists()
+        assert app.read_prefixes(app.STATE) == [a] and not app.PENDING.exists()
         assert not app.update_prefix(a, force=False)
         assert app.update_prefix(a)  # Repeated manual updates must accept our existing policy route.
         assert not any(key[0] == "main" for key in kernel.routes)
@@ -124,26 +127,36 @@ def check_updates():
         kernel.routes.clear()
         assert app.update_prefix(a, force=False)  # Restore a missing route independently.
 
-        kernel.failures.add(("del", a))
-        fails(lambda: app.update_prefix(b))
-        assert app.read_prefix(app.STATE) == a and app.read_prefix(app.PENDING) == b
-        assert set(kernel.rules) == {a, b}
+        for prefix in (b, c, d, e):
+            assert app.update_prefix(prefix)
+        assert app.read_prefixes(app.STATE) == [a, b, c, d, e]
+        assert set(kernel.rules) == {a, b, c, d, e}
+        assert app.update_prefix(a, force=False)
+        assert app.read_prefixes(app.STATE) == [b, c, d, e, a]
+
+        kernel.failures.add(("del", b))
+        fails(lambda: app.update_prefix(f))
+        assert app.read_prefixes(app.STATE) == [b, c, d, e, a]
+        assert app.read_prefix(app.PENDING) == f
+        assert set(kernel.rules) == {a, b, c, d, e, f}
         kernel.failures.clear()
         assert app.update_prefix(force=False)
-        assert set(kernel.rules) == {b} and app.read_prefix(app.STATE) == b
+        assert set(kernel.rules) == {a, c, d, e, f}
+        assert app.read_prefixes(app.STATE) == [c, d, e, a, f]
         assert not app.PENDING.exists()
 
-        kernel.failures.add(("replace", c))
-        fails(lambda: app.update_prefix(c))
-        assert set(kernel.rules) == {b} and not app.PENDING.exists()  # Rollback succeeded.
-        kernel.failures.add(("del", c))
-        fails(lambda: app.update_prefix(c))
-        assert app.read_prefix(app.PENDING) == c and set(kernel.rules) == {b, c}
-        fails(lambda: app.update_prefix(a))  # Do not lose track of failed rollback.
-        assert a not in kernel.rules and app.read_prefix(app.PENDING) == c
+        kernel.failures.add(("replace", g))
+        fails(lambda: app.update_prefix(g))
+        assert set(kernel.rules) == {a, c, d, e, f} and not app.PENDING.exists()
+        kernel.failures.add(("del", g))
+        fails(lambda: app.update_prefix(g))
+        assert app.read_prefix(app.PENDING) == g and set(kernel.rules) == {a, c, d, e, f, g}
+        fails(lambda: app.update_prefix(c))  # Do not lose track of failed rollback.
+        assert app.read_prefix(app.PENDING) == g
         kernel.failures.clear()
-        assert app.update_prefix(a)
-        assert set(kernel.rules) == {a} and app.read_prefix(app.STATE) == a
+        assert app.update_prefix(c)
+        assert set(kernel.rules) == {a, c, d, e, f}
+        assert app.read_prefixes(app.STATE) == [d, e, a, f, c]
 
         replace = Path.replace
 
@@ -153,24 +166,27 @@ def check_updates():
             return replace(path, target)
 
         with patch.object(Path, "replace", interrupted_commit):
-            fails(lambda: app.update_prefix(b))
-        assert app.read_prefix(app.STATE) == a  # The previous file was not truncated.
-        assert app.read_prefix(app.PENDING) == b and set(kernel.rules) == {b}
+            fails(lambda: app.update_prefix(g))
+        assert app.read_prefixes(app.STATE) == [d, e, a, f, c]  # The previous file was not truncated.
+        assert app.read_prefix(app.PENDING) == g and set(kernel.rules) == {a, c, e, f, g}
         assert app.update_prefix(force=False)
-        assert app.read_prefix(app.STATE) == b and not app.PENDING.exists()
+        assert app.read_prefixes(app.STATE) == [e, a, f, c, g] and not app.PENDING.exists()
 
         kernel.rules.clear()
+        kernel.routes.clear()
         kernel.save()
-        kernel.failures.add(("add", b))
+        kernel.failures.add(("add", e))
         fails(lambda: app.update_prefix(force=False))
-        assert app.read_prefix(app.PENDING) == b
+        assert app.read_prefix(app.PENDING) == e
         kernel.failures.clear()
-        assert app.update_prefix(force=False)  # Startup recovery retries even for the same IP.
+        assert app.update_prefix(force=False)  # Startup recovery retries the interrupted IP.
+        assert app.update_prefix(force=False)  # Then restores the other saved rules in one pass.
+        assert set(kernel.rules) == {a, c, e, f, g}
 
-        kernel.routes["10001", c] = "proto static via 192.0.2.9 dev eth1"
-        fails(lambda: app.update_prefix(c))
-        assert kernel.routes["10001", c] == "proto static via 192.0.2.9 dev eth1"
-        assert set(kernel.rules) == {b}
+        kernel.routes["10001", h] = "proto static via 192.0.2.9 dev eth1"
+        fails(lambda: app.update_prefix(h))
+        assert kernel.routes["10001", h] == "proto static via 192.0.2.9 dev eth1"
+        assert set(kernel.rules) == {a, c, e, f, g}
         before = len(kernel.calls)
         for invalid in ("0.0.0.0/0", "8.8.8.0/24", "127.0.0.1/32", "8.8.8.8/32\nflush"):
             fails(lambda: app.update_prefix(invalid))

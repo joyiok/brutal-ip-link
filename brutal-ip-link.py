@@ -21,6 +21,7 @@ STATE = Path("/var/lib/brutal-ip-link/current-prefix")
 PENDING = STATE.with_name("pending-prefix")
 RULES = Path("/proc/net/tcp_brutal/rules")
 CTL = "/usr/local/bin/brutalctl"
+MAX_PREFIXES = 5
 UPDATE_LOCK = threading.Lock()
 XRAY_SOURCE = re.compile(
     r"^(?:\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2}(?:\.\d+)? )?"
@@ -80,20 +81,36 @@ def policy_route(prefix):
     subprocess.run(policy_route_args(prefix, default[0]), check=True, timeout=10)
 
 
-def read_prefix(path):
+def read_prefixes(path):
     if not path.exists():
-        return ""
-    prefix = path.read_text().strip()
-    network = ipaddress.ip_network(prefix, strict=True)
-    if network.prefixlen != network.max_prefixlen:
-        raise ValueError(f"invalid host prefix in {path}")
-    return prefix_for(str(network.network_address))
+        return []
+    prefixes = []
+    for prefix in path.read_text().splitlines():
+        network = ipaddress.ip_network(prefix, strict=True)
+        if network.prefixlen != network.max_prefixlen:
+            raise ValueError(f"invalid host prefix in {path}")
+        prefix = prefix_for(str(network.network_address))
+        if prefix in prefixes:
+            raise ValueError(f"duplicate host prefix in {path}")
+        prefixes.append(prefix)
+    return prefixes
+
+
+def read_prefix(path):
+    prefixes = read_prefixes(path)
+    if len(prefixes) > 1:
+        raise ValueError(f"multiple host prefixes in {path}")
+    return prefixes[0] if prefixes else ""
 
 
 def write_prefix(path, prefix):
+    write_prefixes(path, [prefix])
+
+
+def write_prefixes(path, prefixes):
     temporary = path.with_suffix(".tmp")
     with temporary.open("w") as output:
-        output.write(prefix + "\n")
+        output.writelines(prefix + "\n" for prefix in prefixes)
         output.flush()
         os.fsync(output.fileno())
     temporary.replace(path)
@@ -127,23 +144,46 @@ def remove_prefix(prefix):
             )
 
 
+def prefix_ready(prefix):
+    rule = rule_for(prefix)
+    return (rule.get("rate") == str(RATE * 125_000) and rule.get("lock") == "1"
+            and "congctl lock brutal" in routes_for(prefix, TABLE or "main", owned=True))
+
+
 def update_prefix(prefix=None, force=True):
     with UPDATE_LOCK:
-        old, pending = read_prefix(STATE), read_prefix(PENDING)
-        prefix = prefix or pending or old
+        saved, pending = read_prefixes(STATE), read_prefix(PENDING)
+        requested = prefix is not None
+        if prefix is None and not pending:
+            changed = False
+            for current in saved:
+                if prefix_ready(current):
+                    continue
+                write_prefix(PENDING, current)
+                subprocess.run([CTL, "add", current, str(RATE)] + (["noroute"] if TABLE else []),
+                               check=True, timeout=10)
+                policy_route(current)
+                PENDING.unlink()
+                changed = True
+            return changed
+        prefix = prefix or pending
         if not prefix:
             return False
         network = ipaddress.ip_network(prefix, strict=True)
         if prefix_for(str(network.network_address)) != prefix:
             raise ValueError("only canonical public host prefixes are allowed")
-        if pending and pending not in (old, prefix):
+        if pending and pending not in saved and pending != prefix:
             remove_prefix(pending)
             PENDING.unlink()
-        if not force and old == prefix and not pending:
-            rule = rule_for(prefix)
-            if (rule.get("rate") == str(RATE * 125_000) and rule.get("lock") == "1"
-                    and "congctl lock brutal" in routes_for(prefix, TABLE or "main", owned=True)):
+        if requested:
+            updated = ([item for item in saved if item != prefix] + [prefix])[-MAX_PREFIXES:]
+        else:
+            updated = saved if prefix in saved else (saved + [prefix])[-MAX_PREFIXES:]
+        if not force and prefix in saved and not pending and prefix_ready(prefix):
+            if updated == saved:
                 return False
+            write_prefixes(STATE, updated)
+            return True
         # Record ownership before any side effect so an interrupted update is recoverable.
         write_prefix(PENDING, prefix)
         try:
@@ -151,16 +191,17 @@ def update_prefix(prefix=None, force=True):
                            check=True, timeout=10)
             policy_route(prefix)
         except Exception:
-            if prefix != old:
+            if prefix not in saved:
                 try:
                     remove_prefix(prefix)
                     PENDING.unlink()
                 except Exception as error:
                     print(f"rollback pending: {error}", file=sys.stderr, flush=True)
             raise
-        if old and old != prefix:
-            remove_prefix(old)
-        write_prefix(STATE, prefix)
+        for old in saved:
+            if old not in updated:
+                remove_prefix(old)
+        write_prefixes(STATE, updated)
         PENDING.unlink()
         return True
 
