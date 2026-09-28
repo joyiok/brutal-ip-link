@@ -1,0 +1,16 @@
+[Unit]
+Description=Update TCP Brutal and restore tracked IP rules
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/brutal-ip-link/env
+ExecStart=/usr/local/sbin/brutal-ip-link update-brutal --scheduled
+ExecStopPost=/usr/local/sbin/brutal-ip-link reconcile
+TimeoutStartSec=35min
+TimeoutStopSec=2min
+StateDirectory=brutal-ip-link
+UMask=0077
+PrivateTmp=true
+ProtectHome=true

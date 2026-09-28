@@ -1,0 +1,11 @@
+[Unit]
+Description=Check for TCP Brutal updates daily
+
+[Timer]
+OnCalendar=*-*-* 04:00:00
+RandomizedDelaySec=1h
+Persistent=true
+Unit=brutal-ip-link-update.service
+
+[Install]
+WantedBy=timers.target
