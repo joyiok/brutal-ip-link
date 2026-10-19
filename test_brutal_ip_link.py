@@ -57,6 +57,7 @@ class Kernel:
         self.rules = {}
         self.routes = {}
         self.failures = set()
+        self.fail_listing = False
         self.calls = []
 
     def save(self):
@@ -87,6 +88,14 @@ class Kernel:
             if operation == "show":
                 if args[-1] == "default":
                     output = "default via 192.0.2.1 dev eth0 src 192.0.2.2 onlink"
+                elif "exact" not in args:
+                    if self.fail_listing:
+                        raise subprocess.CalledProcessError(1, args)
+                    # A whole-table listing prints host routes without their prefix length.
+                    output = "".join(
+                        f"{prefix.split('/')[0]} {route.replace('proto 233 ', '')}\n"
+                        for (name, prefix), route in self.routes.items()
+                        if name == table and "proto 233" in route and (":" in prefix) == (args[1] == "-6"))
                 else:
                     prefix = args[args.index("exact") + 1]
                     output = self.routes.get((table, prefix), "")
@@ -281,15 +290,18 @@ def check_ttl_and_cache():
         app.update_prefix(A)
         app.update_prefix(B)
         before = len(kernel.calls)
-        with patch.object(app.os, "fsync", wraps=app.os.fsync) as fsync:
+        latest = app.time.time() + 100
+        with patch.object(app.os, "fsync", wraps=app.os.fsync) as fsync, \
+                patch.object(app, "load_state", wraps=app.load_state) as load:
             for prefix in [A, B] * 10:
-                app.update_prefix(prefix, force=False)
-            assert len(kernel.calls) == before and fsync.call_count == 0
+                app.update_prefix(prefix, force=False, seen_at=latest)
+            assert len(kernel.calls) == before and fsync.call_count == 0 and load.call_count == 0
         kernel.rules.clear()
         kernel.routes.clear()
         kernel.save()
         app.update_prefix(force=False)  # Maintenance must bypass the cache.
         assert set(kernel.rules) == {A, B}
+        assert entries()[A]["last_seen"] == latest  # Cached logs still refresh LRU order.
     with fixture() as kernel, patch.object(app, "TTL", 60):
         with patch.object(app.time, "time", return_value=100):
             app.update_prefix(A)
@@ -310,6 +322,25 @@ def check_ttl_and_cache():
         kernel.failures.clear()
         app.update_prefix(force=False)
         assert set(kernel.rules) == {B, C}
+
+
+def check_batched_checks():
+    with fixture() as kernel, patch.object(app, "MAX_PREFIXES", 100), \
+            patch.object(app, "module_versions", return_value=("2.0.1", "2.0.1")):
+        prefixes = [f"8.8.0.{i}/32" for i in range(1, 61)] + ["2606:4700:4700::1111/128"]
+        for prefix in prefixes:
+            app.update_prefix(prefix)
+        before = len(kernel.calls)
+        app.update_prefix(force=False)
+        assert len(kernel.calls) - before == 2  # One route listing per family, not one ip call per address.
+        assert all(row["ready"] for row in app.status_report()["entries"])
+        del kernel.routes["10001", prefixes[0]]
+        app.update_prefix(force=False)
+        assert ("10001", prefixes[0]) in kernel.routes  # Missing from the listing, so checked and repaired.
+        kernel.fail_listing = True
+        del kernel.routes["10001", prefixes[1]]
+        app.update_prefix(force=False)
+        assert ("10001", prefixes[1]) in kernel.routes  # Without a listing, addresses are checked one by one.
 
 
 def check_installer():
@@ -644,7 +675,7 @@ def check_tls():
 
 if __name__ == "__main__":
     for check in (check_logs, check_updates, check_retry_isolation, check_state_recovery,
-                  check_table_migration, check_ttl_and_cache, check_installer,
+                  check_table_migration, check_ttl_and_cache, check_batched_checks, check_installer,
                   check_config_and_cli, check_installer_flow, check_journal_recovery,
                   check_ready_notification, check_locking_and_uninstall, check_updater,
                   check_http_auth):

@@ -139,15 +139,46 @@ def atomic_write(path, text):
         os.close(directory)
 
 
-def rule_for(prefix):
+def rules_by_prefix():
+    rules = {}
     try:
         for line in RULES.read_text().splitlines():
             fields = dict(word.split("=", 1) for word in line.split() if "=" in word)
-            if fields.get("dst") == prefix:
-                return fields
+            rules.setdefault(fields.get("dst"), fields)
     except FileNotFoundError:
         pass
-    return {}
+    return rules
+
+
+def rule_for(prefix):
+    return rules_by_prefix().get(prefix, {})
+
+
+def owned_routes(family):
+    # One listing per family; ip prints host routes without their prefix length.
+    output = subprocess.run(
+        ["ip", family, "route", "show", "table", TABLE or "main", "proto", "233"],
+        check=True, capture_output=True, text=True, timeout=10,
+    ).stdout
+    routes = {}
+    for line in output.splitlines():
+        try:
+            prefix = str(ipaddress.ip_network(line.split()[0]))
+        except (IndexError, ValueError):
+            continue  # Route types such as "unreachable" and multipath continuation lines.
+        routes[prefix] = routes.get(prefix, "") + line + "\n"
+    return routes
+
+
+def kernel_snapshot(prefixes):
+    # Lets a pass confirm healthy rules with one read and one ip call per family.
+    try:
+        routes = {}
+        for family in {"-6" if ":" in prefix else "-4" for prefix in prefixes}:
+            routes.update(owned_routes(family))
+        return rules_by_prefix(), routes
+    except Exception:
+        return None  # The per-address checks still run and report the error.
 
 
 def remove_route(prefix, table):
@@ -166,9 +197,16 @@ def remove_prefix(prefix, tables=None):
         remove_route(prefix, table)
 
 
-def prefix_ready(prefix):
-    rule = rule_for(prefix)
-    return (rule.get("rate") == str(RATE * 125_000) and rule.get("lock") == "1"
+def rule_matches(rule):
+    return rule.get("rate") == str(RATE * 125_000) and rule.get("lock") == "1"
+
+
+def prefix_ready(prefix, snapshot=None):
+    if snapshot:
+        rules, routes = snapshot
+        if rule_matches(rules.get(prefix, {})) and "congctl lock brutal" in routes.get(prefix, ""):
+            return True  # A snapshot only confirms readiness; anything else is checked directly.
+    return (rule_matches(rule_for(prefix))
             and "congctl lock brutal" in routes_for(prefix, TABLE or "main", owned=True))
 
 
@@ -274,7 +312,7 @@ def expire_entries(data):
             SEEN.pop(prefix, None)
 
 
-def sync_entry(data, prefix, force=False):
+def sync_entry(data, prefix, force=False, snapshot=None):
     entry = data["entries"][prefix]
     changed = False
     try:
@@ -288,7 +326,7 @@ def sync_entry(data, prefix, force=False):
         if target not in entry["tables"]:
             entry["tables"].append(target)
             save_state(data)  # Own the new table before writing any route to it.
-        if force or not prefix_ready(prefix):
+        if force or not prefix_ready(prefix, snapshot):
             assert_route_owned(prefix, target)
             existed = bool(rule_for(prefix))
             try:
@@ -336,10 +374,11 @@ def reconcile(data):
         save_state(data)
     errors = {}
     changed = False
+    snapshot = kernel_snapshot(data["entries"])
     # One bad IP must never prevent the remaining rules or cleanups from running.
     for prefix in list(data["entries"]):
         try:
-            changed = sync_entry(data, prefix) or changed
+            changed = sync_entry(data, prefix, snapshot=snapshot) or changed
         except Exception as error:
             errors[prefix] = str(error)
             print(f"retry pending for {prefix}: {error}", file=sys.stderr, flush=True)
@@ -359,17 +398,19 @@ def reconcile(data):
 def update_prefix(prefix=None, force=True, seen_at=None, lock_timeout=None):
     if prefix is not None:
         validate_prefix(prefix)
+        observed = time.time() if seen_at is None else seen_at
+        cached = READY_CACHE.get(prefix)
+        if (not force and cached and cached[1:] == (TABLE, RATE)
+                and time.monotonic() - cached[0] < CACHE_SECONDS):
+            # Repeated connection logs skip the lock and state file; maintenance merges SEEN.
+            SEEN[prefix] = max(observed, SEEN.get(prefix, 0))
+            return False
     with state_lock(lock_timeout):
         data = load_state()
         if prefix is None:
             return reconcile(data)[0]
         entry = data["entries"].get(prefix)
-        observed = time.time() if seen_at is None else seen_at
         seen = SEEN[prefix] = max(observed, SEEN.get(prefix, 0), entry["last_seen"] if entry else 0)
-        cached = READY_CACHE.get(prefix)
-        if (not force and entry and entry["desired"] and not entry.get("error") and cached
-                and cached[1:] == (TABLE, RATE) and time.monotonic() - cached[0] < CACHE_SECONDS):
-            return False
         # Batch last_seen/LRU writes for known addresses. New addresses and
         # explicit changes always commit before touching the kernel.
         if entry and entry["desired"] and not force:
@@ -651,11 +692,12 @@ def status_report():
     # Atomic replacement lets read-only diagnostics run during a long DKMS build.
     data = load_state()
     installed, loaded = module_versions()
+    snapshot = kernel_snapshot(data["entries"])
     rows = []
     for prefix, entry in sorted(data["entries"].items(), key=lambda item: item[1]["last_seen"], reverse=True):
         row = dict(entry, prefix=prefix, ready=False)
         try:
-            row["ready"] = prefix_ready(prefix)
+            row["ready"] = prefix_ready(prefix, snapshot)
         except Exception as error:
             row["error"] = str(error)
         rows.append(row)
