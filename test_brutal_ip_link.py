@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 from contextlib import ExitStack, contextmanager, redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest.mock import MagicMock, Mock, patch
@@ -644,6 +645,16 @@ def check_tls():
                     idle.sendall(b"GET /")
                     request()  # An incomplete HTTP request cannot block another client.
                     assert idle.recv(1) == b""
+            with socket.create_connection(server.server_address, timeout=2) as raw:
+                with client_tls.wrap_socket(raw, server_hostname="localhost") as slow:
+                    started = time.monotonic()
+                    try:
+                        for byte in b"GET / HTTP/1.0\r\nX: " + b"y" * 20:
+                            slow.sendall(bytes([byte]))  # Each byte arrives within the read timeout.
+                            time.sleep(0.1)
+                    except OSError:
+                        pass
+                    assert time.monotonic() - started < 2  # Trickling cannot outlast the request deadline.
             request(b"/\xff")  # Non-ASCII paths do not crash compare_digest.
             with patch.object(server, "tls") as context, patch.object(
                 server, "finish_request", side_effect=ConnectionResetError

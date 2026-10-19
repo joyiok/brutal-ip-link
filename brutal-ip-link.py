@@ -560,11 +560,25 @@ def maintain_rules():
         STOP.wait(CHECK_INTERVAL)
 
 
+class DeadlineSocket(ssl.SSLSocket):
+    # Reads share one deadline, so a client trickling bytes cannot hold a slot.
+    deadline = None
+
+    def recv_into(self, *args, **kwargs):
+        if self.deadline is not None:
+            remaining = self.deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("request deadline exceeded")
+            self.settimeout(remaining)
+        return super().recv_into(*args, **kwargs)
+
+
 class TLSServer(ThreadingHTTPServer):
     request_timeout = 5
 
     def __init__(self, address, handler, tls):
         self.tls = tls
+        tls.sslsocket_class = DeadlineSocket
         self.slots = threading.BoundedSemaphore(32)
         if ":" in address[0]:
             self.address_family = socket.AF_INET6
@@ -589,6 +603,8 @@ class TLSServer(ThreadingHTTPServer):
         try:
             request.settimeout(self.request_timeout)
             request = self.tls.wrap_socket(request, server_side=True)
+            # The handshake already has a total deadline; give the request one too.
+            request.deadline = time.monotonic() + self.request_timeout
             self.finish_request(request, address)
         except (OSError, ssl.SSLError):
             pass  # Timeouts and peers closing a connection are normal on a public listener.
