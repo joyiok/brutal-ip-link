@@ -88,11 +88,10 @@ def routes_for(prefix, table, owned=False):
 
 
 def policy_route(prefix):
+    # sync_entry has already checked that any existing route is ours.
     if not TABLE:
         return
     family = "-6" if ":" in prefix else "-4"
-    # ip omits the protocol field when filtering by it; compare matching route counts.
-    assert_route_owned(prefix, TABLE)
     default = subprocess.run(
         ["ip", family, "route", "show", "table", TABLE, "default"],
         check=True,
@@ -106,6 +105,7 @@ def policy_route(prefix):
 
 
 def assert_route_owned(prefix, table):
+    # ip omits the protocol field when filtering by it; compare matching route counts.
     if len(routes_for(prefix, table).splitlines()) != len(routes_for(prefix, table, owned=True).splitlines()):
         raise ValueError(f"refusing to replace an unmanaged route in table {table}")
 
@@ -373,7 +373,8 @@ def update_prefix(prefix=None, force=True, seen_at=None, lock_timeout=None):
         # Batch last_seen/LRU writes for known addresses. New addresses and
         # explicit changes always commit before touching the kernel.
         if entry and entry["desired"] and not force:
-            return sync_entry(data, prefix)
+            # Maintenance retries failures; retrying on every connection log only adds load.
+            return False if entry.get("error") else sync_entry(data, prefix)
         merge_seen(data)
         if not entry:
             entry = data["entries"][prefix] = new_entry(seen)
@@ -420,14 +421,18 @@ def xray_source(line):
 
 def watch_xray():
     global XRAY_PROCESS
-    with state_lock():
-        previous = load_state().get("xray", {})
-    cursor = previous.get("cursor", "") if previous.get("unit") == XRAY_UNIT else ""
-    XRAY_STATUS.update(previous if previous.get("unit") == XRAY_UNIT else {})
-    XRAY_STATUS.update(unit=XRAY_UNIT, connected=False)
+    cursor = None
     while not STOP.is_set():
         process = None
         try:
+            if cursor is None:
+                # Load inside the retry loop: a bad state file must not end detection.
+                with state_lock():
+                    previous = load_state().get("xray", {})
+                if previous.get("unit") != XRAY_UNIT:
+                    previous = {}
+                XRAY_STATUS.update(previous, unit=XRAY_UNIT, connected=False)
+                cursor = previous.get("cursor", "")
             process = subprocess.Popen(
                 ["journalctl", "-fu", XRAY_UNIT, "-o", "json"]
                 + (["--after-cursor", cursor] if cursor else ["--since", "-5 min"]),
@@ -493,6 +498,15 @@ def watch_xray():
                 process.stdout.close()
             XRAY_PROCESS = None
         STOP.wait(5)
+
+
+def notify_ready():
+    # With Type=notify, systemctl start/restart waits for this and reports early exits.
+    address = os.environ.pop("NOTIFY_SOCKET", "")
+    if address:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as sock:
+            sock.connect("\0" + address[1:] if address.startswith("@") else address)
+            sock.sendall(b"READY=1")
 
 
 def maintain_rules():
@@ -925,6 +939,7 @@ def main():
         workers.append(threading.Thread(target=watch_xray, daemon=True))
     for worker in workers:
         worker.start()
+    notify_ready()
     STOP.wait()
     process = XRAY_PROCESS
     if process is not None and process.poll() is None:

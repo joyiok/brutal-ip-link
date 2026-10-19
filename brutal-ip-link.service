@@ -4,7 +4,7 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-Type=simple
+Type=notify
 EnvironmentFile=/etc/brutal-ip-link/env
 ExecStart=/usr/local/sbin/brutal-ip-link
 Restart=on-failure

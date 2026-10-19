@@ -198,6 +198,19 @@ def check_retry_isolation():
         kernel.failures.clear()
         app.update_prefix(force=False)
         assert all(not e["error"] for e in entries().values())
+    with fixture() as kernel:
+        kernel.failures.add(("add", A))
+        fails(lambda: app.update_prefix(A, force=False))
+        before = len(kernel.calls)
+        latest = app.time.time() + 100
+        with patch.object(app.os, "fsync", wraps=app.os.fsync) as fsync:
+            for offset in range(10):
+                assert not app.update_prefix(A, force=False, seen_at=latest - offset)
+            assert len(kernel.calls) == before and fsync.call_count == 0  # No retry per connection log.
+        kernel.failures.clear()
+        app.update_prefix(force=False)
+        assert A in kernel.rules and not entries()[A]["error"]
+        assert entries()[A]["last_seen"] == latest  # Skipped logs still refresh LRU order.
 
 
 def check_state_recovery():
@@ -434,6 +447,38 @@ def check_journal_recovery():
                 app.update_prefix(force=False)
                 assert A in kernel.rules
                 assert app.load_state()["xray"]["cursor"] == "cursor-1"
+    with fixture() as kernel, patch.object(app, "XRAY_UNIT", "xray.service"), \
+            patch.object(app, "STOP", threading.Event()):
+        app.state_path().write_text("{")
+        event = {"MESSAGE": "from 8.8.8.8:1 accepted tcp:example.com:443 email: owner", "__CURSOR": "cursor-2"}
+        process = Mock(returncode=0)
+        process.stdout = io.StringIO(json.dumps(event) + "\n")
+        process.poll.return_value = 0
+        def wait(_):
+            if app.state_path().read_text() == "{":
+                app.state_path().unlink()  # The operator repairs the state file.
+            else:
+                app.STOP.set()
+        with patch.object(app.subprocess, "Popen", return_value=process), \
+                patch.object(app.STOP, "wait", side_effect=wait), redirect_stdout(io.StringIO()):
+            app.watch_xray()
+        assert A in kernel.rules  # Detection resumes without restarting the daemon.
+
+
+def check_ready_notification():
+    with tempfile.TemporaryDirectory() as directory:
+        path = str(Path(directory) / "notify")
+        name = f"brutal-ip-link-test-{os.getpid()}"
+        for address, bound in ((path, path), ("@" + name, "\0" + name)):
+            with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as receiver, \
+                    patch.dict(os.environ, {"NOTIFY_SOCKET": address}):
+                receiver.bind(bound)
+                receiver.settimeout(2)
+                app.notify_ready()
+                assert receiver.recv(64) == b"READY=1"
+                assert "NOTIFY_SOCKET" not in os.environ  # Child commands must not inherit it.
+    with patch.dict(os.environ, {}, clear=True):
+        app.notify_ready()  # Not started by systemd.
 
 
 def check_locking_and_uninstall():
@@ -601,7 +646,8 @@ if __name__ == "__main__":
     for check in (check_logs, check_updates, check_retry_isolation, check_state_recovery,
                   check_table_migration, check_ttl_and_cache, check_installer,
                   check_config_and_cli, check_installer_flow, check_journal_recovery,
-                  check_locking_and_uninstall, check_updater, check_http_auth):
+                  check_ready_notification, check_locking_and_uninstall, check_updater,
+                  check_http_auth):
         check()
         print(check.__name__ + ": PASS")
     if "--tls" in sys.argv:
