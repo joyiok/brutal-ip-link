@@ -25,7 +25,7 @@
 - Linux 5.10+；
 - 已安装并加载 TCP Brutal v2，`brutalctl` 支持 `noroute`；
 - `/usr/local/bin/brutalctl` 可用；
-- Python 3.12+、systemd、iproute2；启用 HTTPS 时需要 OpenSSL；
+- Python 3.9+、systemd、iproute2；启用 HTTPS 时需要 OpenSSL；
 - 自动更新需要 kmod（`modinfo` / `modprobe`）和到 GitHub、`tcp.hy2.sh` 的 HTTPS 访问；
   上游安装脚本会检查 DKMS、内核头文件和编译工具。
 
@@ -310,6 +310,7 @@ bash -n install.sh
 以及 IPv4 / IPv6 TLS 和连接超时。安装脚本测试使用临时目录和模拟系统命令；
 自动更新测试模拟下载与编译，不会实际安装或卸载内核模块。
 
-本次新增功能在 Python 3.14 上执行回归测试；真实 DKMS 升级仍需在目标服务器验证。
+回归测试（含 TLS）已在 Python 3.9、3.10、3.11（Debian 12 系统自带）和 3.14 上通过；
+真实 DKMS 升级仍需在目标服务器验证。
 原有版本曾在 Python 3.13、Xray 26.3.27 和 TCP Brutal v2 环境验证 REALITY / PROXY protocol
 转发链路、同一 IP 重复更新，以及公网 IP 变化后的自动切换和旧规则清理。
